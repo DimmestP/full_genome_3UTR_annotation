@@ -1,0 +1,257 @@
+---
+title: "Inferred genome-wide yeast 3'UTR annotation"
+author: "Sam Haynes"
+date: "18/03/2020"
+output: html_document
+---
+
+```{r import_data_and_libraries, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE,warning=FALSE,message = FALSE)
+
+library(tidyverse)
+library(testthat)
+
+# import names and genomic coordinates of all known yeast genes
+Scer_ORF <- readDNAStringSet("https://downloads.yeastgenome.org/sequence/S288C_reference/orf_dna/orf_coding_all.fasta.gz")
+Scer_ORF_name <- as_tibble(names(Scer_ORF)) %>%
+  separate(value,c("transcriptName",NA),extra="drop",sep=" ")
+
+# import the full yeast genomic sequence to convert genomic coordinates to sequences
+# BiocManager::install("BSgenome.Scerevisiae.UCSC.sacCer3")
+full_yeast_genome_annotation <- BSgenome::getBSgenome("BSgenome.Scerevisiae.UCSC.sacCer3")
+seqnames(full_yeast_genome_annotation) <-as.character(c(1:17))
+
+# import pelechano major 3'UTR/5'UTR isoform dataset
+pelechano_major_isoform_data_set <- read_tsv("./data/pelechano_TIFseq.txt") %>%
+  separate(`chr strand t5 t3 ypd gal type name`,into = c("chr","strand"),sep = " ",extra="merge") %>%
+  separate(strand,into = c("strand","t5"),sep = " ",extra="merge") %>%
+  separate(t5,into = c("t5","t3"),sep = " ",extra="merge") %>%
+  separate(t3,into = c("t3","ypd"),sep = " ",extra="merge") %>%
+  separate(ypd,into = c("ypd","gal"),sep = " ",extra="merge") %>%
+  separate(gal,into = c("gal","type"),sep = " ",extra="merge") %>%
+  separate(type,into = c("type","transcriptName"),sep = " (?=[A-Z0-9\\-_m]+$)",extra="merge") %>%
+  filter(!str_detect(type,"SUT"),!(transcriptName == "NA"),!str_detect(type,"CUT"),!(type == "Covering one intact ORF"))
+
+# Create a tibble of the main and the complement of the yeast genome (for genes on the negative strand)
+main_and_rev_comp_full_yeast_genome <- tibble(chr = vector(mode = "character"), mainChrom = vector(mode = "character"), compChrom = vector(mode = "character"))
+
+latin_numbers = c("I","II","III","IV","V","VI","VII","VIII","IX","X","XI","XII","XIII","XIV","XV","XVI","M")
+
+for(i in 1:17){
+  main_and_rev_comp_full_yeast_genome <- main_and_rev_comp_full_yeast_genome %>%
+    bind_rows(tibble(chr = latin_numbers[i], mainChrom = toString(full_yeast_genome_annotation[[i]]), compChrom = toString(complement(full_yeast_genome_annotation[[i]]))))
+}
+```
+
+```{r define_functions}
+
+# function to extract main sequence ORF genomic coordinates for all genes in the yeast genome from annotation data in the SGD file
+extract_ORF_genomic_coordinates <- function(all_Scer_gene_names){
+  all_coords = ""
+  for(i in 1:length(all_Scer_gene_names)){
+    gene_name = all_Scer_gene_names[i]
+    # be careful to transverse introns
+    if(str_detect(gene_name,"intron sequence removed")){
+      # first extract coordiantes of all ORF segments of intronic gene
+      temp_coord <- str_extract(gene_name,"(?<=Chr [A-Z]{1,4} from )[0-9\\-,]+")
+      
+      # extract coordinates the opposite way around if on the negative strand
+      if(str_detect(gene_name,"reverse complement")){
+        temp_coord <- paste0(str_extract(temp_coord,"(?<=^[0-9]{1,12}\\-)[0-9]+"),"-",str_extract(temp_coord,"[0-9]+(?=\\-[0-9]+,$)"))
+      }
+      #  else extract coordinates normally
+      else{
+        temp_coord <- paste0(str_extract(temp_coord,"^[0-9]+"),"-",str_extract(temp_coord,"[0-9]+(?=,$)"))
+      }
+    }
+    # for genes without introns just extract first detected coordinates
+    else {
+      temp_coord <- str_extract(gene_name,"(?<=Chr [A-Z]{1,4} from )[0-9\\-]+")
+      
+      if(str_detect(gene_name,"reverse complement")){
+        temp_coord <- paste0(str_extract(temp_coord,"[0-9]+(?=$)"),"-",str_extract(temp_coord,"(?<=^)[0-9]+"))
+      }
+    }
+    all_coords[i] = temp_coord
+  }
+  all_coords
+}
+  
+# general function to convert coordinates to sequences
+position_to_sequence <- function(startPos,endPos,chromosomeSeq){
+   str_sub(chromosomeSeq,startPos,endPos)
+}
+
+# function to convert 3'UTR positions to actual sequences
+# requires a global variable main_and_rev_comp_full_yeast_genome to run
+# it consists of a tibble with columns chr, mainChrom and compChrom
+# chromosome number (in latin), main sequence and complementary sequence for each
+genomic_coordinates_to_sequence_conversion <- function(chromosome_number,t3,coord_start,coord_end,reverse){
+  coordData <- tibble(chromosome_number,coord_start,coord_end,reverse,t3)
+  negativeStrand <- coordData %>% 
+    filter(reverse)
+  
+  positiveStrand <- coordData %>% 
+    filter(!reverse)
+  
+  complementChromosomeSeq <- main_and_rev_comp_full_yeast_genome %>% 
+    filter(chr == chromosome_number) %>% 
+    pull(compChrom)
+  
+  mainChromosomeSeq <- main_and_rev_comp_full_yeast_genome %>% 
+    filter(chr == chromosome_number) %>% 
+    pull(mainChrom)
+  
+  # add threePrimeUTR sequences to strand (reverse sequence so that start/stop codons are in the same orientation as main strand)
+  negativeStrand <- negativeStrand %>%
+    group_by(coord_end) %>%
+    mutate(threePrimeUTR = stri_reverse(map_chr(t3, position_to_sequence, coord_start - 1, complementChromosomeSeq)))
+  
+  positiveStrand <- positiveStrand %>%
+    group_by(coord_end) %>%
+    mutate(threePrimeUTR = map_chr(coord_end + 1, position_to_sequence, t3, mainChromosomeSeq))
+    
+    bind_rows(negativeStrand,positiveStrand) %>%
+      pull(threePrimeUTR)
+}
+
+find_3UTR_length_from_percentile <- function(threePrimeUTR,counts,percentile=0.5){
+  counts = tibble(utr_length = str_length(threePrimeUTR),counts) %>% 
+    arrange(utr_length) %>%
+    pull(counts)
+  cut_off <- floor(sum(counts)*percentile)
+  j <- 1
+  i <- 1
+  rolling_sum <- counts[1]
+  if(length(counts) > 1){
+    while(rolling_sum < cut_off){
+      i = i + 1
+      rolling_sum = rolling_sum + counts[i]
+    }
+  }
+  
+  (as.tibble(threePrimeUTR) %>% mutate(length = str_length(threePrimeUTR)) %>% arrange(length) %>% pull(value))[i]
+}
+
+# function calculate 3'UTR end point in genomic coordinates
+UTR_end_calc <- function(coord_start,coord_end,medianUTRLength,reverse) {
+  if(reverse){
+    t3 = coord_start - medianUTRLength
+  }
+  else{
+    t3 = coord_end + medianUTRLength
+  }
+  as.integer(ceiling(t3))
+}
+```
+
+```{r function_tests}
+test_that("extract_ORF_genomic_coordinates works for genes on the main or reverse strand even if they contain introns", {
+  # test gene is on main sequence with no introns
+  expect_equal(extract_ORF_genomic_coordinates(names(Scer_ORF)[2]),"143707-147531")
+  # test gene is on reverse sequence with no introns
+  expect_equal(extract_ORF_genomic_coordinates(names(Scer_ORF)[200]),"90223-90531")
+  # test gene is on main sequence with introns
+  expect_equal(extract_ORF_genomic_coordinates(names(Scer_ORF)[4001]),"625864-626205")
+  # test gene is on reverse sequence with introns
+  expect_equal(extract_ORF_genomic_coordinates(names(Scer_ORF)[1]),"147594-151166")
+})
+
+test_that("genomic_coordinates_to_sequence_conversion works for genes on the main or reverse strand", {
+  # test gene is on main sequence
+  expect_equal(genomic_coordinates_to_sequence_conversion("I",147587,143707,147531,FALSE),"CATTTCTAAATATTTAATACAACTTTGGTTACATAAAAGTAAAATTTATACACCTC")
+  # test gene is on reverse sequence
+  expect_equal(genomic_coordinates_to_sequence_conversion("XVI",728899,728947,729528,TRUE),"TTATTTTACAAGTAAATATATATATGCAAGATCATTTTTTCGTCATTC")
+  })
+
+test_that("find_3UTR_length_from_percentile works for differing percentiles", {
+  # test median length output, odd total counts input
+  expect_equal(find_3UTR_length_from_percentile(c("TGAAATGAGGTGTATAAATTTTACTTTTATGTAACCAAAGTTGTATTAAATATTTAGAAATGTTATACTATTTTTGGGTT"
+,"TGAAATGAGGTGTATAAATTTTACTTTTATGTAACC"),c(2,3)),"TGAAATGAGGTGTATAAATTTTACTTTTATGTAACC")
+  # test median length output, even total counts input
+  expect_equal(find_3UTR_length_from_percentile(c("GAACTTTTCAATCTACGAAAAATATATGTCCGCAATATAGAACACAATTAGGTTTATATTCGACGTGATTTTTTTTTCTTCCTTAGCCCTATGTATATTTACTGTATAGGATAAATGAAATACCAAAAATAAAAAAGTATAAAACGAAAGAATATAACCCTCGTTTATATCTGGTC","GAACTTTTCAATCTACGAAAAATATATGTCCGCAATATAGAACACAATTAGGTTTATATTCGACGTGATTTTTTTTTCTTCCTTAGCCCTATGTATATTTACTGTATAGGATAAATGAAATACCAAAAATAAAAAAGTATAAAACGAAAGAATATAACCCTCGTTT","GAACTTTTCAATCTACGAAAAATATATGTCCGCAATATAGAACACAATTAGGTTTATATTCGACGTGATTTTTTTTTCTTCCTTAGCCCTATGTATATTTACTGTATAGGATAAATGAAATACCAAAAATAAAAAAGTATAAAACGAAAGAATATAACCC","GAACTTTTCAATCTACGAAAAATATATGTCCGCAATATAGAACACAATTAGGTTTATATTCGACGTGATTTTTTTTTCTTCCTTAGCCCTATGTATATTTACTGTATAGGATAAATGAAATACCAAAAATAAAAAAGTATAAAACG","GAACTTTTCAATCTACGAAAAATATATGTCCGCAATATAGAACACAATTAGGTTTATATTCGACGTGATTTTTTTTTCTTCCTTAGCCCTATGTATATTTACTGTATAGGATAAATGAAATACC","GAACTTTTCAATCTACGAAAAATATATGTCCGCAATATAGAACACAATTAGGTTTATATTCG"),c(51,2,2,207,9,3)),"GAACTTTTCAATCTACGAAAAATATATGTCCGCAATATAGAACACAATTAGGTTTATATTCGACGTGATTTTTTTTTCTTCCTTAGCCCTATGTATATTTACTGTATAGGATAAATGAAATACCAAAAATAAAAAAGTATAAAACG")
+  
+   # test 80 percentile length output, even total counts input
+  expect_equal(find_3UTR_length_from_percentile(c("TGAGTAATGTGAAATAAAATAAAGGTTTTAATATACAGGTTAAAAAATAAGTAATACAATGTGTATAATCATAATGGCGTTAAAGCAGAATAAAGTAACCGAACACCTTATCTTTTGTGTCTTCT","TGAGTAATGTGAAATAAAATAAAGGTTTTAATATACAGGTTAAAAAATAAGTAATACAATGTGTATAATCATAATGGCGTTAAAGCAGAATAAAGTAACCGAACACCTT","TGAGTAATGTGAAATAAAATAAAGGTTTTAATATACAGGTTAAAAAATAAGTAATACAATGTGTATAATCATAATGGCGTTAAAGCAGAATAAAGTAACCG","TGAGTAATGTGAAATAAAATAAAGGTTTTAATATACAGGTTAAAAAATAAGTAATACAATGTGTATAATCATAATGGCGTTAAAGCAGAATAAAGT"),c(3,3,12,2),0.8),"TGAGTAATGTGAAATAAAATAAAGGTTTTAATATACAGGTTAAAAAATAAGTAATACAATGTGTATAATCATAATGGCGTTAAAGCAGAATAAAGTAACCGAACACCTT")
+  
+  # test 20 percentile length output, odd total counts input
+  expect_equal(find_3UTR_length_from_percentile(c("AAAACCGATAACAAAGTGATGGCTTAATATTATAACTTCTATATAACGGATATATTTTATGGTAAATGTACATATTTCAGTAATGGTAATAATGACTTTTC","AAAACCGATAACAAAGTGATGGCTTAATATTATAACTTCTATATAACGGATATATTTTATGGTAAATGTACATATTTCAGTAATGGTAATAATGACTTTTCTTTTTATCTT"),c(4,11),0.2),"AAAACCGATAACAAAGTGATGGCTTAATATTATAACTTCTATATAACGGATATATTTTATGGTAAATGTACATATTTCAGTAATGGTAATAATGACTTTTC")
+})
+
+test_that("UTR_end_calc works for genes on the reverse and main strand",{
+  # gene on main strand
+  expect_equal(UTR_end_calc(12046,12426,554,FALSE),12980)
+  
+  # gene on reverse strand
+  expect_equal(UTR_end_calc(7235,9016,222,TRUE),7013)
+})
+```
+
+```{r infer_genome_wide_yeast_3UTR}
+all_gene_coords <- extract_ORF_genomic_coordinates(names(Scer_ORF))
+
+# create new dataframe with orf positions, chromosome and strand for all known genes in the yeast genome
+yeast_genes_genomic_coords <- tibble(
+  transcriptName = Scer_ORF_name$transcriptName,
+  chr = str_extract(names(Scer_ORF),"(?<=Chr )[A-Z]{1,4}"),
+  coordinates = all_gene_coords,
+  reverse = str_detect(names(Scer_ORF),"reverse complement")
+  ) %>%
+  separate(coordinates,into = c("coord_start","coord_end"),sep = "-") %>%
+  mutate(coord_start = as.integer(coord_start),coord_end = as.integer(coord_end))
+
+# correct annotaion error for introns in the raw pelechano data
+corrected_pelechano_3UTR_data_set <- pelechano_major_isoform_data_set  %>%
+  select(-chr,-strand,-type) %>%
+  group_by(transcriptName,t3,t5) %>% 
+  summarise(counts = sum(as.integer(ypd) + sum(as.integer(gal)))) %>%
+  group_by(transcriptName,t3) %>% 
+  summarise(counts=sum(counts))  %>%
+  ungroup() %>%
+  inner_join(yeast_genes_genomic_coords)
+
+# extract 3UTR sequences from genomic coordinates
+tif_seq_3UTR_sequences <- corrected_pelechano_3UTR_data_set %>%
+  filter((reverse & t3 < coord_start) | (!reverse & t3 > coord_end)) %>%
+  group_by(transcriptName,t3) %>%
+  mutate(threePrimeUTR = map_chr(chr,genomic_coordinates_to_sequence_conversion,t3,coord_start,coord_end,reverse)) %>% 
+  ungroup() %>%
+  select(transcriptName,threePrimeUTR,counts)
+
+# find the median lengths of 3UTRs
+median_tif_seq_3UTR_sequences <- tif_seq_3UTR_sequences %>%
+  group_by(transcriptName) %>%
+  summarise(threePrimeUTR = find_3UTR_length_from_percentile(threePrimeUTR,counts))
+
+# What is the mean median length of 3UTRs?
+mean_median_length <- mean(str_length(median_tif_seq_3UTR_sequences$threePrimeUTR))
+
+# find the 20th percentile lengths of 3UTRs
+twentieth_percentile_tif_seq_3UTR_sequences <- tif_seq_3UTR_sequences %>%
+  group_by(transcriptName) %>%
+  summarise(threePrimeUTR = find_3UTR_length_from_percentile(threePrimeUTR,counts,0.2))
+
+# What is the mean twentieth percentile length of 3UTRs?
+mean_twentieth_percentile_length <- mean(str_length(twentieth_percentile_tif_seq_3UTR_sequences$threePrimeUTR))
+
+# find the eightieth percentile lengths of 3UTRs
+eightieth_percentile_tif_seq_3UTR_sequences <- tif_seq_3UTR_sequences %>%
+  group_by(transcriptName) %>%
+  summarise(threePrimeUTR = find_3UTR_length_from_percentile(threePrimeUTR,counts,0.8))
+
+# What is the mean eightieth percentile length of 3UTRs?
+mean_eightieth_percentile_length <- mean(str_length(eightieth_percentile_tif_seq_3UTR_sequences$threePrimeUTR))
+
+# infer missing 3'UTR sequences given mean median UTR length
+inferred_median_yeast_3UTR<- yeast_genes_genomic_coords %>%
+  filter(!is.na(coord_start)) %>%
+  filter(!(transcriptName %in% median_tif_seq_3UTR_sequences$transcriptName)) %>%
+  mutate(UTR_length = ceiling(mean_median_length)) %>%
+  group_by(transcriptName) %>%
+  mutate(t3 = UTR_end_calc(coord_start,coord_end,UTR_length,reverse)) %>%
+  transmute(threePrimeUTR = genomic_coordinates_to_sequence_conversion(chr,t3,coord_start,coord_end,reverse))
+
+# Full yeast genome 3'UTR sequences
+complete_median_3UTR_sequences <- median_tif_seq_3UTR_sequences %>%
+  bind_rows(inferred_median_yeast_3UTR)
+```
